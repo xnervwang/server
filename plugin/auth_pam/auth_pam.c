@@ -48,7 +48,7 @@ static const unsigned int sleep_limit= 5;
 static int pam_auth(MYSQL_PLUGIN_VIO *vio, MYSQL_SERVER_AUTH_INFO *info)
 {
   int p_to_c[2], c_to_p[2]; /* Parent-to-child and child-to-parent pipes. */
-  pid_t proc_id;
+  pid_t proc_id, wres;
   int result= CR_ERROR, pkt_len= 0;
   unsigned char field, *pkt;
   unsigned int n_sleep= 0;
@@ -187,23 +187,25 @@ static int pam_auth(MYSQL_PLUGIN_VIO *vio, MYSQL_SERVER_AUTH_INFO *info)
 error_ret:
   close(p_to_c[1]);
   close(c_to_p[0]);
-  while (waitpid(proc_id, NULL, WNOHANG) != (int) proc_id)
+
+  while (!res /* auth_pam_tool was actually spawned. */ &&
+         (wres= waitpid(proc_id, NULL, WNOHANG)) != proc_id)
   {
-    if (n_sleep++ == sleep_limit)
+    if ((int) wres == -1 && errno != EINTR)
     {
       /*
-        The auth_pam_tool application doesn't terminate.
-        Means something wrong happened there like pam_xxx.so hanged.
+        This means the auth_pam_tool already reaped elsewhere.
       */
-      kill(proc_id, SIGKILL);
-      sleep_time= 1000000; /* 1 second wait should be enough. */
-      PAM_DEBUG((stderr, "PAM: auth_pam_tool doesn't terminate,"
-                         " have to kill it.\n"));
-    }
-    else if (n_sleep > sleep_limit)
       break;
+    }
+    if (n_sleep++ == sleep_limit)
+    {
+      PAM_DEBUG((stderr, "PAM: auth_pam_tool doesn't terminate.\n"));
+      break;
+    }
     usleep(sleep_time);
-    sleep_time*= 10;
+    if (n_sleep <= sleep_limit)
+      sleep_time*= 10;
   }
 
   PAM_DEBUG((stderr, "PAM: auth result %d.\n", result));

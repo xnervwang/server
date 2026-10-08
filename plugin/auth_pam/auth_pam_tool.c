@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <mysql/plugin_auth_common.h>
 
 struct param {
@@ -25,6 +26,14 @@ struct param {
 
 
 #include "auth_pam_tool.h"
+
+/*
+  Hard limit for the whole PAM conversation, including the round trips
+  to the client (password/OTP prompts). It should exceed the server's
+  login timeout (connect_timeout, 10 seconds by default), so it never
+  cuts off a login the server would still accept.
+*/
+#define AUTH_PAM_TOOL_TIMEOUT 120
 
 
 static int roundtrip(struct param *param, const unsigned char *buf,
@@ -70,6 +79,46 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused)))
   unsigned char field;
   int res;
   char a_buf[MYSQL_USERNAME_LENGTH + 1 + 1024];
+  pid_t pid;
+
+  /*
+    We do the 'doubleforking' trick to avoid creating zombie processes.
+    That can happen when the auth_pam_tool doesn't exit in time and the
+    server can't reap it's status.
+    So we just spawn the child here to do all the work when the 'parent' just
+    returns right away.
+    That means nobody can see the auth_pam_tool return value.
+    But we keep returning -1 on error anyway.
+  */
+  if ((pid= fork()) < 0)
+  {
+    fprintf(stderr, "Got error %d from fork()\n", (int) errno);
+    return -1;
+  }
+  if (pid > 0)
+  {
+    /* Parent process. */
+    return 0;
+  }
+
+  /* Child process. */
+
+  /*
+    The pam_auth_base() call can hang in the PAM module.
+    Terminate the program after AUTH_PAM_TOOL_TIMEOUT seconds.
+  */
+  {
+    /*
+      Unblock the SIGALRM.
+      The server blocks SIGALRM in its threads and the mask is inherited
+      through posix_spawn(), so unblock it or the alarm never gets delivered.
+    */
+    sigset_t alarm_set;
+    sigemptyset(&alarm_set);
+    sigaddset(&alarm_set, SIGALRM);
+    sigprocmask(SIG_UNBLOCK, &alarm_set, NULL);
+    alarm(AUTH_PAM_TOOL_TIMEOUT);
+  }
 
   if ((res= setreuid(0, 0)))
     fprintf(stderr, "Got error %d from setreuid()\n", (int) errno);
