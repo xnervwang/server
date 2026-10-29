@@ -21,17 +21,24 @@
   executing a statement and does not read from or write to the socket.
   The connection is then killed with KILL_DISCONNECT, unless it is idle.
   Only the events the OS reports on its own are used: EPOLLERR and EPOLLHUP
-  on Linux, FD_CLOSE on Windows. The read side is not polled for EOF.
+  on Linux, FD_CLOSE on Windows, EV_EOF of kqueue on BSD and macOS. The last
+  two also report an orderly close. Incoming data is not reported.
 
   A connection is watched from the end of login until THD::disconnect().
 */
 
 #include "violite.h"
 
-#if !defined(EMBEDDED_LIBRARY) && (defined(__linux__) || defined(_WIN32))
+#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__DragonFly__)
+#define DISCONNECT_WATCHER_KQUEUE
+#endif
+
+#if !defined(EMBEDDED_LIBRARY) && (defined(__linux__) || defined(_WIN32) || \
+                                   defined(DISCONNECT_WATCHER_KQUEUE))
 bool disconnect_watcher_start();
 void disconnect_watcher_stop();
-#ifdef __linux__
+#if defined(__linux__) || defined(DISCONNECT_WATCHER_KQUEUE)
 /* The fd to poll in the main loop, and what to call when it is readable */
 int disconnect_watcher_fd();
 void disconnect_watcher_process();

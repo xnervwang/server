@@ -16,7 +16,8 @@
 #include "mariadb.h"
 #include "disconnect_watcher.h"
 
-#if !defined(EMBEDDED_LIBRARY) && (defined(__linux__) || defined(_WIN32))
+#if !defined(EMBEDDED_LIBRARY) && (defined(__linux__) || defined(_WIN32) || \
+                                   defined(DISCONNECT_WATCHER_KQUEUE))
 
 #include "sql_class.h"
 #include "sql_show.h"                           // find_thread_by_id
@@ -131,6 +132,90 @@ void disconnect_watcher_remove(void **handle, Vio *vio)
   */
   if (epfd >= 0 && vio)
     epoll_ctl(epfd, EPOLL_CTL_DEL, vio_fd(vio), nullptr);
+}
+
+#elif defined(DISCONNECT_WATCHER_KQUEUE)
+
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
+#include <fcntl.h>
+
+/*
+  One kqueue with all client sockets, polled by the connection accepting loop
+  like the epoll fd on Linux. A read filter fires on data too, so its low
+  water mark is set out of reach, leaving only EV_EOF and socket errors, which
+  are reported regardless of the mark. EV_EOF is also set by an orderly close.
+*/
+static int kq= -1;
+
+bool disconnect_watcher_start()
+{
+  if ((kq= kqueue()) >= 0)
+  {
+    fcntl(kq, F_SETFD, FD_CLOEXEC);
+    return false;
+  }
+  sql_print_warning("Can't start the client disconnect watcher (errno: %iE)",
+                    errno);
+  return true;
+}
+
+
+void disconnect_watcher_stop()
+{
+  int fd= kq;
+  kq= -1;
+  if (fd >= 0)
+    close(fd);
+}
+
+
+int disconnect_watcher_fd()
+{
+  return kq;
+}
+
+
+void disconnect_watcher_process()
+{
+  struct kevent events[16];
+  static const struct timespec no_wait= {0, 0};
+  int n;
+  while ((n= kevent(kq, nullptr, 0, events, 16, &no_wait)) > 0)
+  {
+    for (int i= 0; i < n; i++)
+      if (events[i].flags & (EV_EOF | EV_ERROR))
+        handle_socket_event((my_thread_id) (uintptr_t) events[i].udata);
+    if (n < 16)
+      break;
+  }
+}
+
+
+void *disconnect_watcher_add(ulonglong thread_id, Vio *vio)
+{
+  if (kq < 0 || !vio || !is_socket_vio(vio))
+    return nullptr;
+  struct kevent ev;
+  EV_SET(&ev, vio_fd(vio), EVFILT_READ, EV_ADD | EV_ONESHOT, NOTE_LOWAT,
+         0x7fffffff, (void *) (uintptr_t) thread_id);
+  return kevent(kq, &ev, 1, nullptr, 0, nullptr) ? nullptr : &kq;
+}
+
+
+void disconnect_watcher_remove(void **handle, Vio *vio)
+{
+  if (!*handle)
+    return;
+  *handle= nullptr;
+  /* ENOENT is fine, the oneshot filter is deleted when it fires */
+  if (kq >= 0 && vio)
+  {
+    struct kevent ev;
+    EV_SET(&ev, vio_fd(vio), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+    kevent(kq, &ev, 1, nullptr, 0, nullptr);
+  }
 }
 
 #else  /* _WIN32 */
