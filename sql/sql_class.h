@@ -702,7 +702,13 @@ enum killed_state : uint32_t
     Used in threadpool to signal wait timeout.
   */
   KILL_WAIT_TIMEOUT= 18,
-  KILL_WAIT_TIMEOUT_HARD= 19
+  KILL_WAIT_TIMEOUT_HARD= 19,
+  /*
+    The client socket failed while the connection was busy,
+    see disconnect_watcher.h
+  */
+  KILL_DISCONNECT= 20,
+  KILL_DISCONNECT_HARD= 21
 
 };
 
@@ -4532,6 +4538,8 @@ public:
   bool       substitute_null_with_insert_id;
   bool	     in_lock_tables;
   bool       bootstrap, cleanup_done, free_connection_done;
+  /* Not NULL if the socket is registered in the client disconnect watcher */
+  void       *disconnect_watch= nullptr;
 
   /**  
     is set if a statement accesses a temporary table created through

@@ -1,0 +1,220 @@
+/* Copyright (c) 2026, MariaDB
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; version 2 of the License.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335  USA */
+
+#include "mariadb.h"
+#include "disconnect_watcher.h"
+
+#if !defined(EMBEDDED_LIBRARY) && (defined(__linux__) || defined(_WIN32))
+
+#include "sql_class.h"
+#include "sql_show.h"                           // find_thread_by_id
+
+/*
+  Synchronization: the watcher holds no lock of its own while it touches a THD.
+  Like KILL, it finds the THD by thread id in server_threads, which returns it
+  with LOCK_thd_kill held, so the THD cannot be deleted. It never uses the
+  socket itself. The watcher may thus act on a stale event, for a THD that is
+  already gone or closing; it is harmless, as the id is never reused.
+  The owner thread unregisters the socket before closing it.
+*/
+
+static bool is_socket_vio(Vio *vio)
+{
+  switch (vio_type(vio)) {
+  case VIO_TYPE_TCPIP:
+  case VIO_TYPE_SOCKET:
+  case VIO_TYPE_SSL:
+    return true;
+  default:
+    return false;
+  }
+}
+
+
+/* The socket reported an error or hangup, kill the connection like KILL does */
+static void handle_socket_event(my_thread_id id)
+{
+  THD *thd= find_thread_by_id(id, false);
+  if (!thd)
+    return;                                     // connection is gone
+
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  thd->awake_no_mutex(KILL_DISCONNECT);
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  mysql_mutex_unlock(&thd->LOCK_thd_kill);
+}
+
+
+#ifdef __linux__
+
+#include <sys/epoll.h>
+
+/*
+  One epoll set with all client sockets, in the oneshot mode and without any
+  requested events. epoll always reports EPOLLERR and EPOLLHUP. Data and
+  EPOLLRDHUP (orderly close by the peer) are not requested.
+  The epoll fd itself is polled by the connection accepting loop in the main
+  thread, which calls disconnect_watcher_process() when it becomes readable.
+*/
+static int epfd= -1;
+
+bool disconnect_watcher_start()
+{
+  if ((epfd= epoll_create1(EPOLL_CLOEXEC)) >= 0)
+    return false;
+  sql_print_warning("Can't start the client disconnect watcher (errno: %iE)",
+                    errno);
+  return true;
+}
+
+
+void disconnect_watcher_stop()
+{
+  int fd= epfd;
+  epfd= -1;
+  if (fd >= 0)
+    close(fd);
+}
+
+
+int disconnect_watcher_fd()
+{
+  return epfd;
+}
+
+
+void disconnect_watcher_process()
+{
+  epoll_event events[16];
+  int n;
+  while ((n= epoll_wait(epfd, events, 16, 0)) > 0)
+  {
+    for (int i= 0; i < n; i++)
+      handle_socket_event((my_thread_id) events[i].data.u64);
+    if (n < 16)
+      break;
+  }
+}
+
+
+void *disconnect_watcher_add(ulonglong thread_id, Vio *vio)
+{
+  if (epfd < 0 || !vio || !is_socket_vio(vio))
+    return nullptr;
+  epoll_event ev= {};
+  ev.events= EPOLLONESHOT;
+  ev.data.u64= thread_id;
+  return epoll_ctl(epfd, EPOLL_CTL_ADD, vio_fd(vio), &ev) ? nullptr : &epfd;
+}
+
+
+void disconnect_watcher_remove(void **handle, Vio *vio)
+{
+  if (!*handle)
+    return;
+  *handle= nullptr;
+  /*
+    The socket is still open, and will be closed after this. An event that is
+    already dequeued is handled safely, see above.
+  */
+  if (epfd >= 0 && vio)
+    epoll_ctl(epfd, EPOLL_CTL_DEL, vio_fd(vio), nullptr);
+}
+
+#else  /* _WIN32 */
+
+#include <new>
+
+/*
+  One manual reset event per connection, signaled by FD_CLOSE (reset, abort
+  or orderly close of the peer), and a wait on it in the system thread pool.
+*/
+struct Watch
+{
+  my_thread_id id;
+  SOCKET s;
+  HANDLE event;
+  PTP_WAIT wait;
+};
+
+static void free_watch(Watch *w)
+{
+  if (w->wait)
+    CloseThreadpoolWait(w->wait);
+  if (w->event)
+    CloseHandle(w->event);
+  delete w;
+}
+
+static VOID CALLBACK on_close(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WAIT,
+                              TP_WAIT_RESULT result)
+{
+  Watch *w= static_cast<Watch*>(context);
+  WSANETWORKEVENTS ne;
+  /* The socket is closed only after disconnect_watcher_remove() */
+  if (result == WAIT_OBJECT_0 && !WSAEnumNetworkEvents(w->s, w->event, &ne) &&
+      (ne.lNetworkEvents & FD_CLOSE))
+    handle_socket_event(w->id);
+}
+
+
+bool disconnect_watcher_start()
+{
+  return false;
+}
+
+
+void disconnect_watcher_stop()
+{
+}
+
+
+void *disconnect_watcher_add(ulonglong thread_id, Vio *vio)
+{
+  if (!vio || !is_socket_vio(vio))
+    return nullptr;
+  Watch *w= new (std::nothrow) Watch();
+  if (!w)
+    return nullptr;
+  w->id= (my_thread_id) thread_id;
+  w->s= vio_fd(vio);
+  if ((w->event= CreateEvent(nullptr, TRUE, FALSE, nullptr)) &&
+      (w->wait= CreateThreadpoolWait(on_close, w, nullptr)) &&
+      !WSAEventSelect(w->s, w->event, FD_CLOSE))
+  {
+    SetThreadpoolWait(w->wait, w->event, nullptr);
+    return w;
+  }
+  free_watch(w);
+  return nullptr;
+}
+
+
+void disconnect_watcher_remove(void **handle, Vio *)
+{
+  Watch *w= static_cast<Watch*>(*handle);
+  if (!w)
+    return;
+  *handle= nullptr;
+  /* Before the socket is closed: stop the events, wait for running callback */
+  WSAEventSelect(w->s, nullptr, 0);
+  SetThreadpoolWait(w->wait, nullptr, nullptr);
+  WaitForThreadpoolWaitCallbacks(w->wait, TRUE);
+  free_watch(w);
+}
+
+#endif /* _WIN32 */
+
+#endif

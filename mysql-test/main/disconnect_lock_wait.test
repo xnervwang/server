@@ -1,0 +1,38 @@
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+
+--echo #
+--echo # MDEV-38741 Client disconnect fails to abort a lock wait
+--echo #
+
+CREATE TABLE t1 (a INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1);
+
+connect (blocker,localhost,root);
+BEGIN;
+SELECT * FROM t1 FOR UPDATE;
+
+connect (con1,localhost,root);
+let $con1_id= `SELECT CONNECTION_ID()`;
+SET innodb_lock_wait_timeout=3600;
+send SELECT * FROM t1 FOR UPDATE;
+
+connection default;
+let $wait_condition=
+  SELECT COUNT(*) = 1 FROM information_schema.innodb_lock_waits;
+--source include/wait_condition.inc
+
+--echo # Disconnect abruptly, the server is not reading from the socket
+connection con1;
+dirty_close con1;
+
+connection default;
+let $wait_condition=
+  SELECT COUNT(*) = 0 FROM information_schema.processlist
+  WHERE id = $con1_id;
+--source include/wait_condition.inc
+
+disconnect blocker;
+DROP TABLE t1;
+
+--echo # End of 10.11 tests

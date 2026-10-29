@@ -28,6 +28,7 @@
 #endif
 #include "sql_audit.h"
 #include "sql_connect.h"
+#include "disconnect_watcher.h"
 #include "thread_cache.h"
 #include "probes_mysql.h"
 #include "sql_parse.h"                          // sql_command_flags,
@@ -1445,6 +1446,7 @@ bool thd_prepare_connection(THD *thd)
                          (char *) thd->security_ctx->host_or_ip);
 
   prepare_new_connection_state(thd);
+  thd->disconnect_watch= disconnect_watcher_add(thd->thread_id, thd->net.vio);
 #ifdef WITH_WSREP
   thd->wsrep_client_thread= true;
   wsrep_open(thd);

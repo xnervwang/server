@@ -60,6 +60,7 @@
 #include "lock.h"
 #include "wsrep_mysqld.h"
 #include "sql_connect.h"
+#include "disconnect_watcher.h"
 #include "sql_cursor.h"                         //Select_materialize
 #ifdef WITH_WSREP
 #include "wsrep_thd.h"
@@ -1826,6 +1827,7 @@ void THD::free_connection()
   my_free(const_cast<char*>(db.str));
   db= null_clex_str;
 #ifndef EMBEDDED_LIBRARY
+  disconnect_watcher_remove(&disconnect_watch, net.vio);
   if (net.vio)
     vio_delete(net.vio);
   net.vio= nullptr;
@@ -2136,6 +2138,13 @@ void THD::awake_no_mutex(killed_state state_to_set,
   mysql_mutex_assert_owner(&LOCK_thd_data);
   mysql_mutex_assert_owner(&LOCK_thd_kill);
 
+  /*
+    An idle connection finds out about a disconnect when it reads from the
+    socket, including the COM_QUIT of an orderly close.
+  */
+  if (state_to_set == KILL_DISCONNECT && get_command() == COM_SLEEP)
+    DBUG_VOID_RETURN;
+
   print_aborted_warning(3, "KILLED");
 
   /*
@@ -2251,6 +2260,8 @@ void THD::disconnect()
 {
   Vio *vio= NULL;
 
+  /* Before the socket is closed, and with no THD locks held. */
+  disconnect_watcher_remove(&disconnect_watch, net.vio);
   set_killed(KILL_CONNECTION);
 
   mysql_mutex_lock(&LOCK_thd_data);
@@ -2362,6 +2373,8 @@ int THD::killed_errno()
   case KILL_CONNECTION_HARD:
   case KILL_SYSTEM_THREAD:
   case KILL_SYSTEM_THREAD_HARD:
+  case KILL_DISCONNECT:
+  case KILL_DISCONNECT_HARD:
     DBUG_RETURN(ER_CONNECTION_KILLED);
   case KILL_QUERY:
   case KILL_QUERY_HARD:

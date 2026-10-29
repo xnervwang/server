@@ -1,0 +1,21 @@
+#
+# MDEV-38741 Client disconnect fails to abort a lock wait
+#
+CREATE TABLE t1 (a INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1);
+connect  blocker,localhost,root;
+BEGIN;
+SELECT * FROM t1 FOR UPDATE;
+a
+1
+connect  con1,localhost,root;
+SET innodb_lock_wait_timeout=3600;
+SELECT * FROM t1 FOR UPDATE;
+connection default;
+# Disconnect abruptly, the server is not reading from the socket
+connection con1;
+disconnect con1;
+connection default;
+disconnect blocker;
+DROP TABLE t1;
+# End of 10.11 tests
