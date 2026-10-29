@@ -1,0 +1,3 @@
+--performance-schema
+--performance-schema-instrument='wait/synch/mutex/aria/%=ON'
+--performance-schema-consumer-events-waits-current=ON

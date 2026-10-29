@@ -546,18 +546,18 @@ end:
    that mysys_test_invalid_symlink() rejects, and open the resolved
    name without following symbolic links.
 
-   @param key   performance schema key
-   @param name  file name
-   @param file  the opened file is stored here
+   @param key        performance schema key
+   @param name       file name
+   @param file       the opened file is stored here
+   @param real_name  the resolved name is stored here (FN_REFLEN bytes)
 
    @return 0  ok
    @return X  error number. The error has been reported.
 */
 
 static int aria_open_file_for_backup(PSI_file_key key, const char *name,
-                                     File *file)
+                                     File *file, char *real_name)
 {
-  char real_name[FN_REFLEN];
   int realpath_err= my_realpath(real_name, name, MYF(0));
 
   if (my_is_symlink(name) &&
@@ -591,14 +591,15 @@ static int aria_open_file_for_backup(PSI_file_key key, const char *name,
 int aria_open_files_for_backup(const char *path,
                                ARIA_BACKUP_CONTEXT *context)
 {
-  char name[FN_REFLEN];
+  char name[FN_REFLEN], data_name[FN_REFLEN];
   int error;
   DBUG_ENTER("aria_open_files_for_backup");
 
   bzero(context, sizeof(*context));
   fn_format(name, path, "", MARIA_NAME_IEXT, MY_REPLACE_EXT);
   if ((error= aria_open_file_for_backup(key_file_kfile, name,
-                                        &context->kfile)))
+                                        &context->kfile,
+                                        context->index_name)))
     DBUG_RETURN(error);
   if ((error= aria_get_capabilities(context->kfile, name,
                                     &context->capabilities)))
@@ -609,7 +610,7 @@ int aria_open_files_for_backup(const char *path,
   }
   fn_format(name, path, "", MARIA_NAME_DEXT, MY_REPLACE_EXT);
   if (!(error= aria_open_file_for_backup(key_file_dfile, name,
-                                         &context->dfile)))
+                                         &context->dfile, data_name)))
     DBUG_RETURN(0);
 
   aria_free_capabilities(&context->capabilities);
@@ -632,6 +633,56 @@ void aria_close_files_for_backup(ARIA_BACKUP_CONTEXT *context)
 
 
 /**
+   @brief Read the header blocks of the index file
+
+   The header blocks have no checksum. The table state at the start of
+   the header is written with my_pwrite(), outside the page cache, so
+   a concurrent read could see part of a write. Read the header while
+   no such write can run: maria_open() and maria_close() hold
+   THR_LOCK_maria, and the other writers of an open table hold
+   MARIA_SHARE::intern_lock.
+
+   @param context     Backup context, positioned in the header
+   @param buffer      read data to this buffer
+   @param buff_length Size of buffer. Must be a multiple of block_size
+
+   @return > 0  number of bytes read into buffer
+   @return < 0  error number
+*/
+
+static longlong aria_read_header(ARIA_BACKUP_CONTEXT *context,
+                                 uchar *buffer, size_t buff_length)
+{
+  const ARIA_TABLE_CAPABILITIES *cap= &context->capabilities;
+  size_t length= (size_t) (cap->header_size / cap->block_size -
+                           context->kblock) * cap->block_size;
+  MARIA_HA *info;
+  size_t bytes_read;
+  DBUG_ENTER("aria_read_header");
+
+  set_if_smaller(length, buff_length);
+  DEBUG_SYNC_C("aria_backup_header");
+  mysql_mutex_lock(&THR_LOCK_maria);
+  if ((info= _ma_test_if_reopen(context->index_name)))
+  {
+    mysql_mutex_lock(&info->s->intern_lock);
+    DEBUG_SYNC_C("aria_backup_header_locked");
+  }
+  bytes_read= my_pread(context->kfile, buffer, length,
+                       context->kblock * cap->block_size, MYF(0));
+  if (info)
+    mysql_mutex_unlock(&info->s->intern_lock);
+  mysql_mutex_unlock(&THR_LOCK_maria);
+
+  if (bytes_read != length)
+    DBUG_RETURN(bytes_read == (size_t) -1 && my_errno
+                ? -(longlong) my_errno : -(longlong) HA_ERR_FILE_TOO_SHORT);
+  context->kblock+= length / cap->block_size;
+  DBUG_RETURN((longlong) length);
+}
+
+
+/**
    @brief Read the next part of the index file
 
    @param context     Backup context with the open files and the
@@ -648,9 +699,14 @@ longlong aria_read_index_file(ARIA_BACKUP_CONTEXT *context,
                               uchar *buffer, size_t buff_length)
 {
   size_t bytes_read;
-  int error= aria_read_index(context->kfile, &context->capabilities,
-                             context->kblock, buffer, buff_length,
-                             &bytes_read);
+  int error;
+  if (context->capabilities.online_backup_safe &&
+      context->kblock < (context->capabilities.header_size /
+                         context->capabilities.block_size))
+    return aria_read_header(context, buffer, buff_length);
+  error= aria_read_index(context->kfile, &context->capabilities,
+                         context->kblock, buffer, buff_length,
+                         &bytes_read);
   if (!error)
   {
     context->kblock+= bytes_read / context->capabilities.block_size;
